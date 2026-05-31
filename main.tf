@@ -107,6 +107,10 @@ data "coder_parameter" "os_image" {
     name  = "Alpine 3.20"
     value = "images:alpine/3.20"
   }
+  option {
+    name  = "NixOS (unstable, arm64)"
+    value = "images:nixos/unstable/arm64"
+  }
 }
 
 # --------------------------------------------------------------------------- #
@@ -118,7 +122,8 @@ data "coder_workspace_owner" "me" {}
 
 locals {
   # Sanitized VM name: incus names must be lowercase alphanumeric + hyphens
-  vm_name = "coder-${replace(lower(data.coder_workspace_owner.me.name), "_", "-")}-${replace(lower(data.coder_workspace.me.name), "_", "-")}"
+  vm_name  = "coder-${replace(lower(data.coder_workspace_owner.me.name), "_", "-")}-${replace(lower(data.coder_workspace.me.name), "_", "-")}"
+  is_nixos = startswith(data.coder_parameter.os_image.value, "images:nixos")
 }
 
 # --------------------------------------------------------------------------- #
@@ -129,7 +134,7 @@ resource "coder_agent" "main" {
   arch = "arm64"
   os   = "linux"
 
-  startup_script = <<-EOT
+  startup_script = local.is_nixos ? "" : <<-EOT
     set -e
     # Install common dev tools if not present
     if ! command -v git &>/dev/null; then
@@ -188,18 +193,18 @@ resource "coder_app" "code_server" {
 
 resource "null_resource" "vm" {
   triggers = {
-    vm_name    = local.vm_name
-    os_image   = data.coder_parameter.os_image.value
-    disk_gb    = data.coder_parameter.disk_gb.value
-    cpu_cores  = data.coder_parameter.cpu_cores.value
-    memory_gb  = data.coder_parameter.memory_gb.value
+    vm_name     = local.vm_name
+    os_image    = data.coder_parameter.os_image.value
+    disk_gb     = data.coder_parameter.disk_gb.value
+    cpu_cores   = data.coder_parameter.cpu_cores.value
+    memory_gb   = data.coder_parameter.memory_gb.value
     agent_token = coder_agent.main.token
   }
 
   # ---- Create / start -------------------------------------------------------
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       set -euo pipefail
 
       VM="${local.vm_name}"
@@ -209,56 +214,152 @@ resource "null_resource" "vm" {
       MEM="${data.coder_parameter.memory_gb.value}"
       AGENT_TOKEN="${coder_agent.main.token}"
       AGENT_URL="${data.coder_workspace.me.access_url}"
+      OWNER="${data.coder_workspace_owner.me.name}"
 
-      # If VM already exists (workspace restart), just start it
+      # If container/VM already exists (workspace restart), just start it
       if incus info "$VM" &>/dev/null; then
-        echo "VM $VM already exists, starting..."
+        echo "$VM already exists, starting..."
         incus start "$VM" || true
         exit 0
       fi
 
-      echo "Creating VM $VM from $IMAGE..."
-      incus launch "$IMAGE" "$VM" \
-        --vm \
-        --config limits.cpu="$CPU" \
-        --config limits.memory="$${MEM}GiB" \
-        --device root,size="$${DISK}GiB"
+      # -----------------------------------------------------------------------
+      # NixOS: run as a container (arm64 VM images not available on linuxcontainers.org)
+      # -----------------------------------------------------------------------
+      if [[ "$IMAGE" == *"nixos"* ]]; then
+        echo "Creating NixOS container $VM from $IMAGE..."
+        incus launch "$IMAGE" "$VM" \
+          --config limits.cpu="$CPU" \
+          --config limits.memory="$${MEM}GiB" \
+          --config security.nesting=true
 
-      echo "Waiting for VM to boot..."
-      for i in $(seq 1 60); do
-        if incus exec "$VM" -- test -f /etc/os-release 2>/dev/null; then
-          break
-        fi
-        sleep 3
-      done
+        echo "Waiting for NixOS to boot..."
+        for i in $(seq 1 90); do
+          if incus exec "$VM" -- nixos-version &>/dev/null; then
+            echo "NixOS is up."
+            break
+          fi
+          sleep 3
+        done
 
-      echo "Installing Coder agent inside VM..."
-      incus exec "$VM" -- bash -c "
-        set -euo pipefail
-        export DEBIAN_FRONTEND=noninteractive
+        echo "Provisioning NixOS container..."
+        incus exec "$VM" -- bash -c "
+          set -euo pipefail
 
-        # Install dependencies
-        apt-get update -qq
-        apt-get install -y curl sudo
+          # Update nix channel
+          nix-channel --add https://nixos.org/channels/nixos-unstable nixos
+          nix-channel --update
 
-        # Create workspace owner user if not exists
-        id -u ${data.coder_workspace_owner.me.name} &>/dev/null || \
-          useradd -m -s /bin/bash -G sudo ${data.coder_workspace_owner.me.name}
-        echo '${data.coder_workspace_owner.me.name} ALL=(ALL) NOPASSWD:ALL' \
-          > /etc/sudoers.d/coder-user
+          # Write NixOS configuration
+          cat > /etc/nixos/configuration.nix <<'NIXCFG'
+{ config, pkgs, ... }:
+{
+  imports = [ ];
 
-        # Install code-server
-        curl -fsSL https://code-server.dev/install.sh | sh -s -- --method standalone --prefix=/usr/local
+  # Container-specific settings (no bootloader needed)
+  boot.isContainer = true;
 
-        # Write Coder agent systemd unit
-        cat > /etc/systemd/system/coder-agent.service <<SERVICE
+  networking.useDHCP = true;
+
+  # Allow nix builds inside container
+  nix.settings.sandbox = false;
+
+  users.users.$OWNER = {
+    isNormalUser = true;
+    extraGroups  = [ \"wheel\" ];
+    shell        = pkgs.bash;
+  };
+
+  security.sudo.wheelNeedsPassword = false;
+
+  environment.systemPackages = with pkgs; [
+    git
+    curl
+    wget
+    vim
+    code-server
+  ];
+
+  systemd.services.coder-agent = {
+    description = \"Coder Agent\";
+    after       = [ \"network-online.target\" ];
+    wants       = [ \"network-online.target\" ];
+    wantedBy    = [ \"multi-user.target\" ];
+    serviceConfig = {
+      User             = \"$OWNER\";
+      ExecStart        = \"/usr/local/bin/coder agent\";
+      Restart          = \"always\";
+      RestartSec       = \"5s\";
+      Environment      = [
+        \"CODER_AGENT_TOKEN=$AGENT_TOKEN\"
+        \"CODER_AGENT_URL=$AGENT_URL\"
+      ];
+    };
+  };
+}
+NIXCFG
+
+          # Download Coder agent binary (arm64)
+          mkdir -p /usr/local/bin
+          curl -fsSL '$AGENT_URL/bin/coder-linux-arm64' -o /usr/local/bin/coder
+          chmod +x /usr/local/bin/coder
+
+          # Create user home if missing
+          mkdir -p /home/$OWNER
+          chown $OWNER:users /home/$OWNER 2>/dev/null || true
+
+          # Apply NixOS configuration
+          nixos-rebuild switch --option sandbox false
+        "
+
+        echo "NixOS container $VM is up and agent is starting."
+
+      # -----------------------------------------------------------------------
+      # Non-NixOS: standard VM path (Ubuntu / Debian / Alpine)
+      # -----------------------------------------------------------------------
+      else
+        echo "Creating VM $VM from $IMAGE..."
+        incus launch "$IMAGE" "$VM" \
+          --vm \
+          --config limits.cpu="$CPU" \
+          --config limits.memory="$${MEM}GiB" \
+          --device root,size="$${DISK}GiB"
+
+        echo "Waiting for VM to boot..."
+        for i in $(seq 1 60); do
+          if incus exec "$VM" -- test -f /etc/os-release 2>/dev/null; then
+            break
+          fi
+          sleep 3
+        done
+
+        echo "Installing Coder agent inside VM..."
+        incus exec "$VM" -- bash -c "
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Install dependencies
+          apt-get update -qq
+          apt-get install -y curl sudo
+
+          # Create workspace owner user if not exists
+          id -u $OWNER &>/dev/null || \
+            useradd -m -s /bin/bash -G sudo $OWNER
+          echo '$OWNER ALL=(ALL) NOPASSWD:ALL' \
+            > /etc/sudoers.d/coder-user
+
+          # Install code-server
+          curl -fsSL https://code-server.dev/install.sh | sh -s -- --method standalone --prefix=/usr/local
+
+          # Write Coder agent systemd unit
+          cat > /etc/systemd/system/coder-agent.service <<SERVICE
 [Unit]
 Description=Coder Agent
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=${data.coder_workspace_owner.me.name}
+User=$OWNER
 Environment=CODER_AGENT_TOKEN=$AGENT_TOKEN
 Environment=CODER_AGENT_URL=$AGENT_URL
 ExecStart=/usr/local/bin/coder agent
@@ -269,26 +370,27 @@ RestartSec=5s
 WantedBy=multi-user.target
 SERVICE
 
-        # Download Coder agent binary (arm64)
-        curl -fsSL '$AGENT_URL/bin/coder-linux-arm64' -o /usr/local/bin/coder
-        chmod +x /usr/local/bin/coder
+          # Download Coder agent binary (arm64)
+          curl -fsSL '$AGENT_URL/bin/coder-linux-arm64' -o /usr/local/bin/coder
+          chmod +x /usr/local/bin/coder
 
-        systemctl daemon-reload
-        systemctl enable --now coder-agent
-      "
+          systemctl daemon-reload
+          systemctl enable --now coder-agent
+        "
 
-      echo "VM $VM is up and agent is running."
+        echo "VM $VM is up and agent is running."
+      fi
     EOT
   }
 
   # ---- Destroy --------------------------------------------------------------
   provisioner "local-exec" {
-    when       = destroy
+    when        = destroy
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       set -euo pipefail
       VM="${self.triggers.vm_name}"
-      echo "Deleting VM $VM..."
+      echo "Deleting $VM..."
       incus delete "$VM" --force || true
       echo "Deleted."
     EOT
@@ -296,7 +398,7 @@ SERVICE
 }
 
 # --------------------------------------------------------------------------- #
-# Stop VM when workspace is stopped (without destroying it)
+# Stop VM/container when workspace is stopped (without destroying it)
 # --------------------------------------------------------------------------- #
 
 resource "null_resource" "vm_stop" {
@@ -310,8 +412,6 @@ resource "null_resource" "vm_stop" {
     when        = destroy
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
-      # This runs on workspace stop (when null_resource.vm is NOT being destroyed)
-      # Incus stop is idempotent
       incus stop "${local.vm_name}" --force 2>/dev/null || true
     EOT
   }
