@@ -412,7 +412,7 @@ resource "null_resource" "vm_stop" {
     when        = destroy
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
-      incus stop "${local.vm_name}" --force 2>/dev/null || true
+      incus stop "${self.triggers.vm_name}" --force 2>/dev/null || true
     EOT
   }
 }
